@@ -1,9 +1,9 @@
 import os
 import sqlalchemy
-from sqlalchemy import text, update
+from sqlalchemy import text
 from google.cloud.sql.connector import Connector, IPTypes
 from flask import jsonify
-from datetime import datetime, timedelta
+from datetime import datetime
 import functions_framework
 
 # Configuración del conector Cloud SQL para cada base de datos con instancias diferentes
@@ -38,7 +38,7 @@ def connect_with_connector(instance_connection_name: str, db_name: str) -> sqlal
 @functions_framework.http
 def escalate_incidents(request):
     try:
-        # Conectar a la base de datos de incidentes
+        # Conectar a la base de datos de incidentes primaria
         instance_connection_name_incidentes = os.environ["INSTANCE_CONNECTION_NAME_INCIDENTES"]
         engine_incidentes = connect_with_connector(instance_connection_name_incidentes, "incidentes")
         
@@ -46,22 +46,26 @@ def escalate_incidents(request):
         instance_connection_name_clientes = os.environ["INSTANCE_CONNECTION_NAME_CLIENTES"]
         engine_clientes = connect_with_connector(instance_connection_name_clientes, "clientes")
 
+        # Conectar a la base de datos de incidentes réplica
+        instance_connection_name_replica = os.environ["INSTANCE_CONNECTION_NAME_REPLICA"]
+        engine_replica = connect_with_connector(instance_connection_name_replica, "incidentes")
+
         # Consultar incidentes abiertos
         with engine_incidentes.connect() as conn_incidentes:
-            query_incidentes = text("SELECT id, cliente_id, fecha_creacion FROM incidente WHERE estado = 'abierto'")
+            query_incidentes = text("SELECT radicado, cliente_id, fecha_creacion FROM incidente WHERE estado = 'abierto'")
             incidentes_abiertos = conn_incidentes.execute(query_incidentes).fetchall()
             print(f"Incidentes abiertos encontrados: {len(incidentes_abiertos)}")
 
             # Procesar cada incidente
             for incidente in incidentes_abiertos:
-                incidente_id = incidente[0]  # Accede por índice
-                cliente_id = incidente[1]    # Accede por índice
+                radicado = incidente[0]     # Accede por índice
+                cliente_id = incidente[1]   # Accede por índice
                 fecha_creacion = incidente[2]  # Accede por índice y es de tipo date
 
                 # Convertir fecha_creacion a datetime para calcular el tiempo transcurrido
                 fecha_creacion_datetime = datetime.combine(fecha_creacion, datetime.min.time())
 
-                print(f"\nProcesando incidente ID: {incidente_id}, Cliente ID: {cliente_id}")
+                print(f"\nProcesando incidente Radicado: {radicado}, Cliente ID: {cliente_id}")
 
                 # Obtener escalation_time del cliente
                 with engine_clientes.connect() as conn_clientes:
@@ -72,17 +76,23 @@ def escalate_incidents(request):
                     # Calcular el tiempo transcurrido desde la creación del incidente
                     tiempo_transcurrido = datetime.utcnow() - fecha_creacion_datetime
                     horas_transcurridas = tiempo_transcurrido.total_seconds() / 3600
-                    print(f"Horas transcurridas para el incidente ID {incidente_id}: {horas_transcurridas}")
+                    print(f"Horas transcurridas para el incidente Radicado {radicado}: {horas_transcurridas}")
 
                     # Verificar si el tiempo transcurrido supera el tiempo de escalación
                     if horas_transcurridas > escalation_time:
-                        print(f"Escalando incidente ID: {incidente_id} a estado 'escalado'")
-                        # Actualizar el estado del incidente a "escalado"
-                        update_query = text("UPDATE incidente SET estado = 'escalado' WHERE id = :incidente_id")
-                        conn_incidentes.execute(update_query, {"incidente_id": incidente_id})
+                        print(f"Escalando incidente Radicado: {radicado} a estado 'escalado'")
+                        # Actualizar el estado del incidente a "escalado" en la base de datos primaria
+                        update_query = text("UPDATE incidente SET estado = 'escalado' WHERE radicado = :radicado")
+                        conn_incidentes.execute(update_query, {"radicado": radicado})
                         conn_incidentes.commit()
+
+                        # Actualizar el estado del incidente en la base de datos réplica
+                        with engine_replica.connect() as conn_replica:
+                            conn_replica.execute(update_query, {"radicado": radicado})
+                            conn_replica.commit()
+
                     else:
-                        print(f"Incidente ID: {incidente_id} aún no ha superado el tiempo de escalación.")
+                        print(f"Incidente Radicado: {radicado} aún no ha superado el tiempo de escalación.")
                 else:
                     print(f"Cliente ID {cliente_id} no tiene definido un tiempo de escalación.")
 
